@@ -35,6 +35,9 @@
 
 #define HT_POISONED_PTR ((HashTable *) (intptr_t) -1)
 
+#define HT_SHRINK_THRESHOLD 32
+#define HT_SHRINK_FACTOR_RECIP 4
+
 #if ZEND_DEBUG
 
 #define HT_OK					0x00
@@ -85,12 +88,14 @@ static void _zend_is_inconsistent(const HashTable *ht, const char *file, int lin
 		ZEND_HASH_DEC_APPLY_COUNT(ht);													\
 	}
 
-#define ZEND_HASH_IF_FULL_DO_RESIZE(ht)				\
+#define ZEND_HASH_IF_FULL_DO_GROW(ht)				\
 	if ((ht)->nNumUsed >= (ht)->nTableSize) {		\
-		zend_hash_do_resize(ht);					\
+		zend_hash_do_grow(ht);					\
 	}
 
-static void ZEND_FASTCALL zend_hash_do_resize(HashTable *ht);
+static void ZEND_FASTCALL zend_hash_do_resize(HashTable *ht, uint32_t nSize);
+static void ZEND_FASTCALL zend_hash_do_grow(HashTable *ht);
+static void ZEND_FASTCALL zend_hash_do_shrink(HashTable *ht);
 
 static zend_always_inline uint32_t zend_hash_check_size(uint32_t nSize)
 {
@@ -589,7 +594,7 @@ static zend_always_inline zval *_zend_hash_add_or_update_i(HashTable *ht, zend_s
 		}
 	}
 
-	ZEND_HASH_IF_FULL_DO_RESIZE(ht);		/* If the Hash table is full, resize it */
+	ZEND_HASH_IF_FULL_DO_GROW(ht);		/* If the Hash table is full, grow it */
 
 add_to_hash:
 	idx = ht->nNumUsed++;
@@ -792,7 +797,7 @@ convert_to_hash:
 		}
 	}
 
-	ZEND_HASH_IF_FULL_DO_RESIZE(ht);		/* If the Hash table is full, resize it */
+	ZEND_HASH_IF_FULL_DO_GROW(ht);		/* If the Hash table is full, grow it */
 
 add_to_hash:
 	idx = ht->nNumUsed++;
@@ -845,28 +850,44 @@ ZEND_API zval* ZEND_FASTCALL _zend_hash_next_index_insert_new(HashTable *ht, zva
 	return _zend_hash_index_add_or_update_i(ht, ht->nNextFreeElement, pData, HASH_ADD | HASH_ADD_NEW | HASH_ADD_NEXT ZEND_FILE_LINE_RELAY_CC);
 }
 
-static void ZEND_FASTCALL zend_hash_do_resize(HashTable *ht)
+static void ZEND_FASTCALL zend_hash_do_resize(HashTable *ht, uint32_t nSize)
 {
+	void *new_data, *old_data = HT_GET_DATA_ADDR(ht);
+	Bucket *old_buckets = ht->arData;
 
+	new_data = pemalloc(HT_SIZE_EX(nSize, -nSize), ht->u.flags & HASH_FLAG_PERSISTENT);
+	ht->nTableSize = nSize;
+	ht->nTableMask = -ht->nTableSize;
+	HT_SET_DATA_ADDR(ht, new_data);
+	memcpy(ht->arData, old_buckets, sizeof(Bucket) * ht->nNumUsed);
+	pefree(old_data, ht->u.flags & HASH_FLAG_PERSISTENT);
+}
+
+static void ZEND_FASTCALL zend_hash_do_grow(HashTable *ht)
+{
 	IS_CONSISTENT(ht);
 	HT_ASSERT_RC1(ht);
 
 	if (ht->nNumUsed > ht->nNumOfElements + (ht->nNumOfElements >> 5)) { /* additional term is there to amortize the cost of compaction */
 		zend_hash_rehash(ht);
 	} else if (ht->nTableSize < HT_MAX_SIZE) {	/* Let's double the table size */
-		void *new_data, *old_data = HT_GET_DATA_ADDR(ht);
 		uint32_t nSize = ht->nTableSize + ht->nTableSize;
-		Bucket *old_buckets = ht->arData;
-
-		new_data = pemalloc(HT_SIZE_EX(nSize, -nSize), ht->u.flags & HASH_FLAG_PERSISTENT);
-		ht->nTableSize = nSize;
-		ht->nTableMask = -ht->nTableSize;
-		HT_SET_DATA_ADDR(ht, new_data);
-		memcpy(ht->arData, old_buckets, sizeof(Bucket) * ht->nNumUsed);
-		pefree(old_data, ht->u.flags & HASH_FLAG_PERSISTENT);
+		zend_hash_do_resize(ht, nSize);
 		zend_hash_rehash(ht);
 	} else {
 		zend_error_noreturn(E_ERROR, "Possible integer overflow in memory allocation (%u * %zu + %zu)", ht->nTableSize * 2, sizeof(Bucket) + sizeof(uint32_t), sizeof(Bucket));
+	}
+}
+
+static void ZEND_FASTCALL zend_hash_do_shrink(HashTable *ht)
+{
+	IS_CONSISTENT(ht);
+	HT_ASSERT_RC1(ht);
+
+	if (ht->nNumUsed > HT_SHRINK_THRESHOLD &&
+    ht->nNumUsed / HT_SHRINK_FACTOR_RECIP > ht->nNumOfElements) {
+		zend_hash_rehash(ht);
+		zend_hash_do_resize(ht, ht->nNumUsed);
 	}
 }
 
@@ -998,6 +1019,7 @@ static zend_always_inline void _zend_hash_del_el_ex(HashTable *ht, uint32_t idx,
 	} else {
 		ZVAL_UNDEF(&p->val);
 	}
+	zend_hash_do_shrink(ht);
 }
 
 static zend_always_inline void _zend_hash_del_el(HashTable *ht, uint32_t idx, Bucket *p)
